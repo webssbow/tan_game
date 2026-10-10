@@ -1,6 +1,6 @@
 This repository contains an environment, trained bot, and GUI to play the Vietnamese game Tấn.
 
-[**Download the latest release here**](https://github.com/webssbow/tan_game/latest)
+[**Download the latest release here**](https://github.com/webssbow/tan_game/releases/latest)
 
 # Build
 
