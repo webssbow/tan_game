@@ -1,0 +1,8 @@
+.DS_Store
+build/
+dist/
+legacy/
+tests/
+.venv/
+__pycache__
+experiments/
