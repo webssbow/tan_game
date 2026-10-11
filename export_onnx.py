@@ -5,13 +5,15 @@ Run once:
     .venv/bin/python export_onnx.py
 
 Produces:
-    web/models/net_0.onnx
-    web/models/net_1.onnx
-    web/models/net_2.onnx
+    docs/models/net_0.onnx
+    docs/models/net_1.onnx
+    docs/models/net_2.onnx
 
 The ONNX net takes a single batched input of shape (N, 3148)
 (obs_dim=335 concatenated with a one-hot action vector of dim=2813)
 and outputs Q-values of shape (N,).
+
+(using docs instead of web so that Github Pages is happy)
 """
 import os, sys
 
@@ -26,7 +28,7 @@ ACTION_DIM = 2813   # NUM_ACTIONS from tan_rlcard
 INPUT_DIM = OBS_DIM + ACTION_DIM  # 3148
 
 MODEL_DIR = "experiments/tan_dmc/tan"
-OUT_DIR = "web/models"
+OUT_DIR = "docs/models"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 for seat in range(3):
@@ -66,4 +68,4 @@ for seat in range(3):
         os.remove(data_file)
     print(f"Exported seat {seat} -> {out} ({os.path.getsize(out)//1024} KB)")
 
-print("Done. Copy web/ to any static host.")
+print("Done. Copy docs/ to any static host.")
