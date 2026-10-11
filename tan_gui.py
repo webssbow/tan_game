@@ -491,15 +491,25 @@ if __name__ == "__main__":
                 for seat in range(NUM_PLAYERS) if seat != HUMAN_SEAT
             }
             splash.after(0, lambda: launch(env, agents))
-        except Exception as exc:
-            splash.after(0, lambda: show_load_error(str(exc)))
+        except BaseException as exc:
+            import traceback
+            msg = traceback.format_exc()
+            splash.after(0, lambda: show_load_error(msg))
 
     def launch(env, agents):
-        splash.destroy()
-        TanTableGUI(env, human_seat=HUMAN_SEAT, agents=agents)
+        try:
+            splash.destroy()
+            TanTableGUI(env, human_seat=HUMAN_SEAT, agents=agents)
+        except BaseException as exc:
+            import traceback
+            msg = traceback.format_exc()
+            show_load_error(msg)
 
     def show_load_error(msg):
-        splash.destroy()
+        try:
+            splash.destroy()
+        except Exception:
+            pass
         root = tk.Tk()
         root.withdraw()
         tk.messagebox.showerror("Failed to load", msg)

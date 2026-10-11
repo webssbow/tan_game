@@ -1,0 +1,1010 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Tan</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #111; color: #eee; font-family: 'Segoe UI', Arial, sans-serif;
+         display: flex; flex-direction: column; align-items: center; min-height: 100vh; }
+  #status  { font-size: 1.2em; font-weight: bold; padding: 8px 0 2px; }
+  #info    { font-size: 0.85em; color: #aaa; padding: 2px 0 6px; min-height: 1.7em; }
+  canvas   { display: block; max-width: 98vw; height: auto; border-radius: 14px;
+             box-shadow: 0 6px 30px rgba(0,0,0,.6); }
+  #actions { display: flex; gap: 8px; padding: 8px 0; flex-wrap: wrap; justify-content: center;
+             min-height: 48px; }
+  button   { background: #2a6a3f; color: #fff; border: none; border-radius: 6px;
+             padding: 7px 18px; font-size: 0.9em; cursor: pointer; }
+  button:hover { background: #3a8a5a; }
+  button.take { background: #a8611f; } button.take:hover { background: #c47528; }
+  button.pass { background: #4b5563; } button.pass:hover { background: #626d7c; }
+  #log     { width: 900px; max-width: 98vw; height: 100px; background: #1a1a1a;
+             border: 1px solid #333; border-radius: 6px; overflow-y: auto; white-space: pre-wrap;
+             font-size: 0.8em; padding: 6px 8px; margin: 4px 0 12px; color: #ccc; }
+  #loading { position: fixed; inset: 0; background: rgba(0,0,0,.85);
+             display: flex; flex-direction: column; align-items: center;
+             justify-content: center; font-size: 1.4em; z-index: 10; gap: 12px; }
+  #loading progress { width: 260px; }
+  #overlay { position: fixed; inset: 0; background: rgba(0,0,0,.7);
+             display: none; align-items: center; justify-content: center; z-index: 9; }
+  #overlay.show { display: flex; }
+  #dialog  { background: #222; border: 2px solid #555; border-radius: 12px;
+             padding: 28px 36px; text-align: center; max-width: 360px; }
+  #dialog h2 { margin-bottom: 12px; }
+  #dialog p  { color: #bbb; margin-bottom: 18px; white-space: pre-line; font-family: Consolas, monospace; }
+  #dialog button { font-size: 1em; padding: 9px 28px; }
+  #dialog .btn-row { display: flex; gap: 12px; justify-content: center; }
+</style>
+</head>
+<body>
+
+<div id="loading">
+  <div>Loading Tan…</div>
+  <progress id="prog" max="3" value="0"></progress>
+  <div id="load-msg" style="font-size:.8em;color:#aaa">Loading models…</div>
+</div>
+
+<div id="overlay">
+  <div id="dialog">
+    <h2 id="dlg-title">Game over</h2>
+    <p id="dlg-body"></p>
+    <div class="btn-row">
+      <button id="dlg-yes">Play again</button>
+      <button id="dlg-no">Quit</button>
+    </div>
+  </div>
+</div>
+
+<div id="status">Tan</div>
+<div id="info"></div>
+<canvas id="c"></canvas>
+<div id="actions"></div>
+<div id="log"></div>
+
+<script type="module">
+import { TanRLGame, AT, NUM_ACTIONS, ALL_SUITS, RANK_VALUE, SUIT_SYMBOLS, CARD_ID,
+         actionToId, cardStr } from './tan_game.js';
+
+// ── ONNX Runtime ─────────────────────────────────────────────────────────
+const ort = await import('https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.mjs');
+ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
+
+const NUM_PLAYERS = 3;
+const HUMAN_SEAT  = 0;
+const AI_DELAY_MS = 700;
+const ANIM_SPEED  = 1.0;          // >1 = faster animations
+const OBS_DIM     = 6*52 + 4 + 5*NUM_PLAYERS + 4;
+
+// ── Load models ──────────────────────────────────────────────────────────
+const sessions = {};
+const prog = document.getElementById('prog');
+const loadMsg = document.getElementById('load-msg');
+for (let seat = 0; seat < NUM_PLAYERS; seat++) {
+  if (seat === HUMAN_SEAT) { prog.value++; continue; }
+  loadMsg.textContent = `Loading model for seat ${seat}…`;
+  sessions[seat] = await ort.InferenceSession.create(`models/net_${seat}.onnx`,
+    { executionProviders: ['wasm'] });
+  prog.value++;
+}
+document.getElementById('loading').style.display = 'none';
+
+// ── AI inference ─────────────────────────────────────────────────────────
+async function aiAction(seat, rlGame) {
+  const obs = rlGame.encodeObs(seat);
+  const legal = rlGame.legal;
+  const N = legal.length;
+  const input = new Float32Array(N * (OBS_DIM + NUM_ACTIONS));
+  for (let i = 0; i < N; i++) {
+    input.set(obs, i * (OBS_DIM + NUM_ACTIONS));
+    input[i * (OBS_DIM + NUM_ACTIONS) + OBS_DIM + actionToId(legal[i])] = 1;
+  }
+  const tensor = new ort.Tensor('float32', input, [N, OBS_DIM + NUM_ACTIONS]);
+  const result = await sessions[seat].run({ input: tensor });
+  const q = result.q_values.data;
+  let best = 0;
+  for (let i = 1; i < N; i++) if (q[i] > q[best]) best = i;
+  return legal[best];
+}
+
+// ── Canvas / layout ──────────────────────────────────────────────────────
+const CW = 900, CH = 640;
+const CARD_W = 62, CARD_H = 88;
+const MINI_S = 0.55, DISCARD_S = 0.78;
+const RED_SUITS = new Set(['H','D']);
+const LAYOUT = {
+  deck:      { x: CW/2 - 28, y: 228 },
+  trumpDx:   44,
+  discard:   { x: CW - 92, y: 372 },
+  tableCx:   CW/2 - 10,
+  tableY:    372,
+  tableSpan: 500,
+  handY:     CH - 70,
+};
+const BOARD_C = { x: CW/2, y: 300 };
+const COLORS = { pass:'#5f6b7a', take:'#d9822b', ok:'#2e9d5b', gold:'#c9a227', swap:'#7b5cd6' };
+
+const canvas = document.getElementById('c');
+const DPR = window.devicePixelRatio || 1;
+canvas.width = CW * DPR; canvas.height = CH * DPR;
+canvas.style.width = CW + 'px';
+const ctx = canvas.getContext('2d');
+ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+function rr(c, x, y, w, h, r) {
+  c.beginPath();
+  c.moveTo(x+r, y);
+  c.lineTo(x+w-r, y); c.arcTo(x+w, y, x+w, y+r, r);
+  c.lineTo(x+w, y+h-r); c.arcTo(x+w, y+h, x+w-r, y+h, r);
+  c.lineTo(x+r, y+h); c.arcTo(x, y+h, x, y+h-r, r);
+  c.lineTo(x, y+r); c.arcTo(x, y, x+r, y, r);
+  c.closePath();
+}
+
+// pre-rendered felt background
+const bg = document.createElement('canvas');
+bg.width = CW * DPR; bg.height = CH * DPR;
+{
+  const b = bg.getContext('2d'); b.scale(DPR, DPR);
+  const grad = b.createRadialGradient(CW/2, CH/2, 60, CW/2, CH/2, CW*0.65);
+  grad.addColorStop(0, '#23854a'); grad.addColorStop(1, '#0c3d1f');
+  b.fillStyle = grad; b.fillRect(0, 0, CW, CH);
+  rr(b, 8, 8, CW-16, CH-16, 18);
+  b.strokeStyle = 'rgba(255,255,255,.07)'; b.lineWidth = 2; b.stroke();
+  rr(b, LAYOUT.tableCx - 295, LAYOUT.tableY - 62, 600, 142, 16);
+  b.setLineDash([6, 6]); b.strokeStyle = 'rgba(255,255,255,.10)'; b.lineWidth = 1.5; b.stroke();
+}
+
+// card-back hatch pattern
+const patC = document.createElement('canvas'); patC.width = patC.height = 8;
+{
+  const p = patC.getContext('2d');
+  p.fillStyle = '#2b5fa8'; p.fillRect(0, 0, 8, 8);
+  p.strokeStyle = 'rgba(255,255,255,.18)'; p.lineWidth = 1.2;
+  p.beginPath(); p.moveTo(0, 8); p.lineTo(8, 0); p.moveTo(-2, 2); p.lineTo(2, -2);
+  p.moveTo(6, 10); p.lineTo(10, 6); p.stroke();
+}
+const backPattern = ctx.createPattern(patC, 'repeat');
+
+// ── Helpers ──────────────────────────────────────────────────────────────
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const lerp = (a, b, t) => a + (b - a) * t;
+const easeInOutCubic = t => t < .5 ? 4*t*t*t : 1 - Math.pow(-2*t + 2, 3) / 2;
+const easeOutCubic = t => 1 - Math.pow(1 - t, 3);
+const easeOutBack = t => { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3*Math.pow(t-1, 3) + c1*Math.pow(t-1, 2); };
+const tiltOf = c => (((CARD_ID.get(c) * 7) % 5) - 2) * 0.025;
+
+function logMsg(msg) {
+  const div = document.getElementById('log');
+  div.textContent += msg + '\n';
+  div.scrollTop = div.scrollHeight;
+}
+
+// ── State ────────────────────────────────────────────────────────────────
+let rlGame = null;
+let view = null;          // what is drawn (lags the real game while animating)
+let busy = false;         // true while a transition is animating
+let gen = 0;              // game generation (stops stale async loops)
+let selectedAtkCard = null;
+let clickRegions = [], hoverKey = null, mouse = null;
+const flights = [];       // cards in motion
+let bubbles = [];         // speech bubbles
+const disp = new Map();   // card -> displayed pose (for smooth re-layout)
+const seen = new Set();
+const fresh = new Map();  // card -> time it arrived in human hand (glow)
+let frameDt = 1/60, lastT = performance.now();
+
+function snapshot() {
+  const g = rlGame.game;
+  return {
+    hands: g.hands.map(h => [...h]),
+    table: g.attackPile.map(e => ({ atk: e.atk, dfn: e.dfn })),
+    draw: [...g.drawPile],
+    discard: g.discardPile.length,
+    trump: g.trump,
+    attacker: g.currentAttacker,
+    defender: g.defender,
+    passed: [...g.passed],
+    active: [...g.currentPlayers],
+    finished: [...g.finishedPlayers],
+    turn: rlGame.currentPlayer,
+    gameOver: g.gameOver,
+  };
+}
+
+function syncView() {
+  const prev = view;
+  view = { ...snapshot(), hidden: new Set() };
+  const same = prev && prev.attacker === view.attacker && prev.defender === view.defender;
+  view.roleT0 = same ? prev.roleT0 : performance.now();
+}
+
+function ownerIn(S, card) {
+  for (let p = 0; p < NUM_PLAYERS; p++) if (S.hands[p].includes(card)) return p;
+  return -1;
+}
+
+const interactive = () =>
+  rlGame && !busy && !rlGame.game.gameOver && rlGame.currentPlayer === HUMAN_SEAT;
+
+// ── Geometry ─────────────────────────────────────────────────────────────
+function seatGeom(p) {
+  if (p === HUMAN_SEAT) {
+    const py = LAYOUT.handY - 72;
+    return { fan: { x: CW/2, y: LAYOUT.handY }, plate: { x: CW/2, y: py },
+             anchor: { x: CW/2, y: py }, bubble: { x: CW/2 - 170, y: py - 6 }, badges: 'right' };
+  }
+  const k = (p - HUMAN_SEAT + NUM_PLAYERS) % NUM_PLAYERS;
+  const ang = Math.PI/2 + k * 2*Math.PI / NUM_PLAYERS;
+  const x = CW/2 + Math.cos(ang) * (CW/2 - 190);
+  const y = 250 + Math.sin(ang) * 145;
+  return { fan: { x, y }, plate: { x, y: y + 44 }, anchor: { x, y: y + 20 },
+           bubble: { x, y: y - 44 }, badges: 'below' };
+}
+
+function sortedHand(h) {
+  const ts = view.trump.suit;
+  const key = c => (c.suit === ts ? 10 : ALL_SUITS.indexOf(c.suit)) * 20 + RANK_VALUE[c.rank];
+  return [...h].sort((a, b) => key(a) - key(b));
+}
+
+function humanSlot(i, n) {
+  const step = Math.min(CARD_W + 12, (CW - 160) / Math.max(1, n));
+  return { x: CW/2 + (i - (n-1)/2) * step, y: LAYOUT.handY };
+}
+
+function oppSlot(p, i, n) {
+  const { fan } = seatGeom(p);
+  const dx = Math.min(13, 150 / Math.max(1, n - 1));
+  const off = i - (n-1)/2;
+  return { x: fan.x + off*dx, y: fan.y + Math.abs(off)*0.6, rot: off * Math.min(0.05, 0.5/n) };
+}
+
+// pose of a card in a hand; uses current displayed pose unless targetOnly
+function handPose(p, card, targetOnly = false) {
+  if (!targetOnly && disp.has(card)) { const d = disp.get(card); return { x: d.x, y: d.y, rot: d.rot, s: d.s }; }
+  if (p === HUMAN_SEAT) {
+    const hand = sortedHand(view.hands[p]);
+    const i = Math.max(0, hand.indexOf(card));
+    return { ...humanSlot(i, hand.length), rot: 0, s: 1 };
+  }
+  const h = view.hands[p];
+  const i = Math.max(0, h.indexOf(card));
+  const sl = oppSlot(p, i, h.length);
+  return { x: sl.x, y: sl.y, rot: sl.rot, s: MINI_S };
+}
+
+function tablePose(i, which, len = view.table.length) {
+  const gap = len > 1 ? Math.min(CARD_W + 26, LAYOUT.tableSpan / (len - 1)) : 0;
+  const x = LAYOUT.tableCx + (i - (len-1)/2) * gap;
+  const c = view.table[i]?.[which];
+  const tilt = c ? tiltOf(c) : 0;
+  return which === 'atk'
+    ? { x, y: LAYOUT.tableY, rot: tilt, s: 1 }
+    : { x: x + 16, y: LAYOUT.tableY + 18, rot: 0.14 + tilt, s: 1 };
+}
+
+function tableCardPose(card) {
+  if (disp.has(card)) { const d = disp.get(card); return { x: d.x, y: d.y, rot: d.rot, s: d.s }; }
+  const i = view.table.findIndex(e => e.atk === card || e.dfn === card);
+  return tablePose(Math.max(0, i), view.table[i]?.dfn === card ? 'dfn' : 'atk');
+}
+
+const trumpPose = () => ({ x: LAYOUT.deck.x + LAYOUT.trumpDx, y: LAYOUT.deck.y, rot: Math.PI/2, s: 1 });
+function deckLayers() { return Math.min(6, Math.ceil(Math.max(0, view.draw.length - 1) / 5)); }
+function deckTopPose() {
+  const l = Math.max(1, deckLayers());
+  return { x: LAYOUT.deck.x - (l-1)*0.8, y: LAYOUT.deck.y - (l-1)*1.6, rot: 0, s: 1 };
+}
+function discardPose(i) {
+  return { x: LAYOUT.discard.x + ((i*37) % 11 - 5), y: LAYOUT.discard.y + ((i*53) % 9 - 4),
+           rot: ((i*73) % 17 - 8) * 0.045, s: DISCARD_S };
+}
+
+// ── View mutations ───────────────────────────────────────────────────────
+function removeFromHand(p, card) {
+  const i = view.hands[p].indexOf(card);
+  if (i >= 0) view.hands[p].splice(i, 1);
+}
+function removeFromTable(card) {
+  for (const e of view.table) { if (e.atk === card) e.atk = null; if (e.dfn === card) e.dfn = null; }
+}
+
+// ── Flights ──────────────────────────────────────────────────────────────
+function fly(o) {
+  return new Promise(resolve => {
+    flights.push({ ...o, dur: (o.dur ?? 400) / ANIM_SPEED,
+      startAt: performance.now() + (o.delay ?? 0) / ANIM_SPEED, started: false, resolve });
+  });
+}
+
+function updateFlights(now) {
+  for (const f of flights) {
+    if (!f.started && now >= f.startAt) {
+      f.p0 = f.from();          // where it is now
+      f.depart?.();             // mutate view (remove from source / reserve slot)
+      f.p1 = f.to();            // where it ends
+      disp.delete(f.card);
+      f.t0 = now; f.started = true;
+    }
+  }
+  for (let i = flights.length - 1; i >= 0; i--) {
+    const f = flights[i];
+    if (f.started && now - f.t0 >= f.dur) {
+      flights.splice(i, 1);
+      f.land?.();
+      disp.set(f.card, { ...f.p1 });   // seamless hand-off to static drawing
+      f.resolve();
+    }
+  }
+}
+
+function flyPlay(p, card, which, atkCard) {
+  return fly({
+    card, dur: 380, face0: p === HUMAN_SEAT, face1: true,
+    from: () => handPose(p, card),
+    depart: () => {
+      removeFromHand(p, card);
+      if (which === 'atk') view.table.push({ atk: card, dfn: null });
+      else { const e = view.table.find(e => e.atk === atkCard); if (e) e.dfn = card; }
+      view.hidden.add(card);
+    },
+    to: () => tablePose(view.table.findIndex(e => e[which] === card), which),
+    land: () => view.hidden.delete(card),
+  });
+}
+
+function flyTableToHand(card, q, delay) {
+  return fly({
+    card, delay, dur: 480, face0: true, face1: q === HUMAN_SEAT,
+    from: () => tableCardPose(card),
+    depart: () => { removeFromTable(card); view.hands[q].push(card); view.hidden.add(card); },
+    to: () => handPose(q, card, true),
+    land: () => { view.hidden.delete(card); if (q === HUMAN_SEAT) fresh.set(card, performance.now()); },
+  });
+}
+
+function flyTableToDiscard(card, idx, delay) {
+  return fly({
+    card, delay, dur: 480, face0: true, face1: false,
+    from: () => tableCardPose(card),
+    depart: () => removeFromTable(card),
+    to: () => discardPose(idx),
+    land: () => { view.discard++; },
+  });
+}
+
+function flyDraw(card, q, delay, isTrumpCard) {
+  return fly({
+    card, delay, dur: 380, face0: isTrumpCard, face1: q === HUMAN_SEAT,
+    from: () => isTrumpCard ? trumpPose() : deckTopPose(),
+    depart: () => {
+      const j = view.draw.lastIndexOf(card);
+      if (j >= 0) view.draw.splice(j, 1);
+      view.hands[q].push(card); view.hidden.add(card);
+    },
+    to: () => handPose(q, card, true),
+    land: () => { view.hidden.delete(card); if (q === HUMAN_SEAT) fresh.set(card, performance.now()); },
+  });
+}
+
+function animateSwap(S0, S1, p) {
+  const oldTrump = S0.trump, two = S1.trump;
+  const a = fly({   // old trump -> player's hand
+    card: oldTrump, dur: 550, face0: true, face1: p === HUMAN_SEAT,
+    from: trumpPose,
+    depart: () => { view.hands[p].push(oldTrump); view.hidden.add(oldTrump); },
+    to: () => handPose(p, oldTrump, true),
+    land: () => view.hidden.delete(oldTrump),
+  });
+  const b = fly({   // 2 of trumps -> under the deck
+    card: two, dur: 550, face0: p === HUMAN_SEAT, face1: true,
+    from: () => handPose(p, two),
+    depart: () => { removeFromHand(p, two); view.draw[0] = two; view.trump = two; view.hidden.add(two); },
+    to: trumpPose,
+    land: () => view.hidden.delete(two),
+  });
+  return Promise.all([a, b]);
+}
+
+// ── Speech bubbles ───────────────────────────────────────────────────────
+function say(seat, text, color, dur = 1500) {
+  bubbles = bubbles.filter(b => b.seat !== seat);
+  bubbles.push({ seat, text, color, t0: performance.now(), dur });
+}
+
+// ── Transition: animate the diff between two snapshots ──────────────────
+async function animateTransition(S0, S1, a) {
+  const actor = a.player;
+
+  // 1. the action itself
+  switch (a.t) {
+    case AT.ATTACK_PASS:  view.passed[actor] = true; say(actor, 'Pass', COLORS.pass); break;
+    case AT.DEFEND_PASS:  view.passed[actor] = true; say(actor, "I'll take them", COLORS.take); break;
+    case AT.DECLINE_SWAP: say(actor, 'Keeps hand', COLORS.pass); break;
+    case AT.SWAP_TRUMP:   say(actor, 'Swaps trump!', COLORS.swap); await animateSwap(S0, S1, actor); break;
+    case AT.ATTACK:
+    case AT.THROWIN:      await flyPlay(actor, a.card, 'atk'); break;
+    case AT.DEFEND:       await flyPlay(actor, a.card, 'dfn', a.atkCard); break;
+  }
+
+  // 2. round end: table -> discard or -> taker
+  const cards = view.table.flatMap(e => [e.atk, e.dfn].filter(Boolean));
+  if (cards.length && S1.table.length === 0) {
+    await sleep(380);
+    const taken = cards.some(c => ownerIn(S1, c) >= 0);
+    say(S0.defender, taken ? `Takes ${cards.length}` : 'Beaten off!', taken ? COLORS.take : COLORS.ok);
+    let di = 0;
+    await Promise.all(cards.map((c, i) => {
+      const q = ownerIn(S1, c);
+      return q >= 0 ? flyTableToHand(c, q, i * 70) : flyTableToDiscard(c, S0.discard + di++, i * 70);
+    }));
+  }
+
+  // 3. draws from the deck (in the true pop order)
+  if (a.t !== AT.SWAP_TRUMP) {
+    const after = new Set(S1.draw);
+    const drawn = S0.draw.map((c, i) => ({ c, i })).filter(o => !after.has(o.c)).sort((x, y) => y.i - x.i);
+    if (drawn.length) {
+      await sleep(180);
+      await Promise.all(drawn.map(({ c }, k) => {
+        const q = ownerIn(S1, c);
+        return q >= 0 ? flyDraw(c, q, k * 110, c === S0.draw[0]) : Promise.resolve();
+      }));
+    }
+  }
+
+  // 4. players who just went out
+  let anyOut = false;
+  for (let p = 0; p < NUM_PLAYERS; p++) {
+    if (S0.active[p] && !S1.active[p]) {
+      say(p, `Finished #${S1.finished.indexOf(p) + 1}!`, COLORS.gold, 2000); anyOut = true;
+    }
+  }
+  if (anyOut) await sleep(400);
+}
+
+// ── Game flow ────────────────────────────────────────────────────────────
+async function newGame() {
+  const myGen = ++gen;
+  rlGame = new TanRLGame({ numPlayers: NUM_PLAYERS, handSize: 6 });
+  rlGame.initGame();
+  selectedAtkCard = null;
+  flights.length = 0; bubbles = []; disp.clear(); fresh.clear();
+  view = null; syncView();
+  logMsg('=== New game ===');
+
+  // deal animation: rebuild the deck as it was before dealing
+  const seq = [];
+  const hs = rlGame.game.handSize;
+  for (let r = 0; r < hs; r++)
+    for (let p = 0; p < NUM_PLAYERS; p++) seq.push({ c: view.hands[p][r], p });
+  view.hands = view.hands.map(() => []);
+  view.draw = [...view.draw, ...seq.map(o => o.c).reverse()];
+  busy = true; updateUI();
+  await sleep(300);
+  await Promise.all(seq.map(({ c, p }, k) => flyDraw(c, p, k * 55, false)));
+  if (myGen !== gen) return;
+  syncView(); busy = false;
+  advance(myGen);
+}
+
+async function advance(myGen = gen) {
+  if (myGen !== gen) return;
+  updateUI();
+  const g = rlGame.game;
+  if (g.gameOver) { setTimeout(showResults, 700); return; }
+  const seat = rlGame.currentPlayer;
+  if (seat === HUMAN_SEAT) return;
+  await sleep(AI_DELAY_MS);
+  if (myGen !== gen) return;
+  const action = await aiAction(seat, rlGame);
+  logMsg(`Player ${seat}: ${describeAction(action)}`);
+  await doStep(action);
+  advance(myGen);
+}
+
+async function doStep(action) {
+  busy = true; updateUI();
+  const S0 = snapshot();
+  rlGame.step(action);
+  const S1 = snapshot();
+  await animateTransition(S0, S1, action);
+  syncView();
+  busy = false;
+}
+
+async function playAction(action) {
+  if (!interactive()) return;
+  logMsg(`You: ${describeAction(action)}`);
+  selectedAtkCard = null;
+  await doStep(action);
+  advance();
+}
+
+function describeAction(a) {
+  switch (a.t) {
+    case AT.ATTACK:       return `attacks with ${cardStr(a.card)}`;
+    case AT.DEFEND:       return `defends ${cardStr(a.atkCard)} with ${cardStr(a.card)}`;
+    case AT.THROWIN:      return `throws in ${cardStr(a.card)}`;
+    case AT.ATTACK_PASS:  return 'passes';
+    case AT.DEFEND_PASS:  return 'takes the cards';
+    case AT.CONTINUE:     return 'continues';
+    case AT.SWAP_TRUMP:   return 'swaps the trump card';
+    case AT.DECLINE_SWAP: return 'keeps their hand';
+    default: return String(a.t);
+  }
+}
+
+// ── Card drawing ─────────────────────────────────────────────────────────
+function drawCard(x, y, { card = null, faceUp = true, s = 1, rot = 0, sx = 1, dim = false,
+                          selected = false, glow = 0, hover = false, shadow = true } = {}) {
+  const trumpSuit = view?.trump?.suit;
+  ctx.save();
+  ctx.translate(x, y);
+  if (rot) ctx.rotate(rot);
+  ctx.scale(s * sx, s);
+  const w = CARD_W, h = CARD_H, x0 = -w/2, y0 = -h/2;
+  if (glow > 0) { ctx.shadowColor = `rgba(255,225,80,${glow})`; ctx.shadowBlur = 20; }
+  else if (shadow) { ctx.shadowColor = 'rgba(0,0,0,.35)'; ctx.shadowBlur = hover ? 14 : 5; ctx.shadowOffsetY = hover ? 6 : 2; }
+  rr(ctx, x0, y0, w, h, 7);
+
+  if (!faceUp || !card) {
+    ctx.fillStyle = '#2b5fa8'; ctx.fill();
+    ctx.shadowColor = 'transparent';
+    rr(ctx, x0+5, y0+5, w-10, h-10, 4);
+    ctx.fillStyle = backPattern; ctx.fill();
+    ctx.strokeStyle = '#9fc1e8'; ctx.lineWidth = 1; ctx.stroke();
+    rr(ctx, x0, y0, w, h, 7);
+    ctx.strokeStyle = '#0b1f3a'; ctx.lineWidth = 1.5; ctx.stroke();
+  } else {
+    const isTrump = trumpSuit && card.suit === trumpSuit;
+    ctx.fillStyle = isTrump ? '#b4eba2' : '#ffffff'; ctx.fill();
+    ctx.shadowColor = 'transparent';
+    ctx.strokeStyle = selected ? '#1db954' : glow > 0 ? '#e0b400' : '#333';
+    ctx.lineWidth = selected ? 3.5 : glow > 0 ? 2.5 : 1.2;
+    ctx.stroke();
+
+    const color = RED_SUITS.has(card.suit) ? '#c8102e' : '#111';
+    const sym = SUIT_SYMBOLS[card.suit];
+    const rk = card.rank === 'T' ? '10' : card.rank;
+    ctx.fillStyle = color; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    const corner = () => {
+      ctx.font = 'bold 14px Georgia, serif'; ctx.fillText(rk, x0 + 11, y0 + 12);
+      ctx.font = '12px Arial';               ctx.fillText(sym, x0 + 11, y0 + 26);
+    };
+    corner();
+    ctx.save(); ctx.rotate(Math.PI); corner(); ctx.restore();
+    ctx.font = '30px Arial'; ctx.fillText(sym, 0, 2);
+    if (dim) { rr(ctx, x0, y0, w, h, 7); ctx.fillStyle = 'rgba(0,0,0,.30)'; ctx.fill(); }
+  }
+  ctx.restore();
+}
+
+// static card with smooth movement toward its target pose
+function placeCard(card, tx, ty, rot, s, opts) {
+  let d = disp.get(card);
+  if (!d) { d = { x: tx, y: ty, rot, s }; disp.set(card, d); }
+  else {
+    const k = 1 - Math.exp(-frameDt * 14);
+    d.x += (tx - d.x) * k; d.y += (ty - d.y) * k; d.rot += (rot - d.rot) * k; d.s += (s - d.s) * k;
+  }
+  seen.add(card);
+  drawCard(d.x, d.y, { ...opts, card, rot: d.rot, s: d.s });
+}
+
+// ── Scene pieces ─────────────────────────────────────────────────────────
+function drawCurvedArrow(a, b, { color, width, alpha, progress, now, animate }) {
+  const M = { x: (a.x + b.x)/2, y: (a.y + b.y)/2 };
+  let vx = M.x - BOARD_C.x, vy = M.y - BOARD_C.y, len = Math.hypot(vx, vy);
+  if (len < 25) { vx = -(b.y - a.y); vy = b.x - a.x; len = Math.hypot(vx, vy) || 1; }
+  const bulge = 0.3 * Math.hypot(b.x - a.x, b.y - a.y) + 30;
+  const Q = { x: M.x + vx/len*bulge, y: M.y + vy/len*bulge };
+  const bez = t => ({ x: (1-t)**2*a.x + 2*(1-t)*t*Q.x + t*t*b.x,
+                      y: (1-t)**2*a.y + 2*(1-t)*t*Q.y + t*t*b.y });
+  const t0 = 0.1, t1 = t0 + (0.9 - t0) * progress;
+  if (t1 <= t0 + 0.02) return;
+
+  ctx.save();
+  ctx.globalAlpha = alpha; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.beginPath();
+  const N = 40;
+  for (let k = 0; k <= N; k++) {
+    const p = bez(t0 + (t1 - t0) * k / N);
+    k ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y);
+  }
+  ctx.strokeStyle = 'rgba(0,0,0,.35)'; ctx.lineWidth = width + 4; ctx.stroke();
+  ctx.strokeStyle = color; ctx.lineWidth = width;
+  if (animate) { ctx.setLineDash([16, 10]); ctx.lineDashOffset = -now / 25; }
+  ctx.stroke(); ctx.setLineDash([]);
+
+  const e = bez(t1), e2 = bez(t1 - 0.02);
+  const ang = Math.atan2(e.y - e2.y, e.x - e2.x);
+  const hl = 10 + width * 2.2;
+  const cos = Math.cos(ang), sin = Math.sin(ang);
+  ctx.beginPath();
+  ctx.moveTo(e.x + cos*hl*0.5, e.y + sin*hl*0.5);
+  ctx.lineTo(e.x - cos*hl*0.6 - sin*hl*0.55, e.y - sin*hl*0.6 + cos*hl*0.55);
+  ctx.lineTo(e.x - cos*hl*0.6 + sin*hl*0.55, e.y - sin*hl*0.6 - cos*hl*0.55);
+  ctx.closePath();
+  ctx.fillStyle = color; ctx.fill();
+  ctx.strokeStyle = 'rgba(0,0,0,.4)'; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.restore();
+}
+
+function drawArrows(now) {
+  if (view.gameOver) return;
+  const d = view.defender;
+  if (!view.active[d]) return;
+  const progress = easeOutCubic(Math.min(1, (now - view.roleT0) / 600));
+  for (let p = 0; p < NUM_PLAYERS; p++) {
+    if (p === d || !view.active[p]) continue;
+    const main = p === view.attacker;
+    const passed = view.passed[p];
+    drawCurvedArrow(seatGeom(p).anchor, seatGeom(d).anchor, {
+      color: main ? '#ff6b3d' : '#ffb199',
+      width: main ? 5 : 2.5,
+      alpha: (main ? 0.95 : 0.6) * (passed ? 0.4 : 1),
+      progress, now, animate: !passed,
+    });
+  }
+}
+
+function drawDeck() {
+  const { x, y } = LAYOUT.deck;
+  const n = view.draw.length;
+  const suit = view.trump.suit, sym = SUIT_SYMBOLS[suit];
+  if (n > 0) {
+    const tc = view.draw[0];
+    if (!view.hidden.has(tc)) { const tp = trumpPose(); drawCard(tp.x, tp.y, { card: tc, rot: tp.rot }); }
+    const layers = deckLayers();
+    if (layers === 0) {
+      rr(ctx, x - CARD_W/2, y - CARD_H/2, CARD_W, CARD_H, 7);
+      ctx.setLineDash([4, 3]); ctx.strokeStyle = 'rgba(255,255,255,.3)'; ctx.lineWidth = 1.5; ctx.stroke(); ctx.setLineDash([]);
+    }
+    for (let k = 0; k < layers; k++) drawCard(x - k*0.8, y - k*1.6, { faceUp: false });
+    const bx = x - CARD_W/2 + 4, by = y - CARD_H/2 - Math.max(0, layers - 1)*1.6 + 4;
+    ctx.beginPath(); ctx.arc(bx, by, 13, 0, Math.PI*2);
+    ctx.fillStyle = '#111'; ctx.fill(); ctx.strokeStyle = '#ffd740'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 12px Segoe UI, Arial';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(String(n), bx, by + 0.5);
+  } else {
+    rr(ctx, x - CARD_W/2, y - CARD_H/2, CARD_W, CARD_H, 7);
+    ctx.setLineDash([4, 3]); ctx.strokeStyle = 'rgba(255,255,255,.3)'; ctx.lineWidth = 1.5; ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = RED_SUITS.has(suit) ? 'rgba(255,120,120,.35)' : 'rgba(255,255,255,.3)';
+    ctx.font = '40px Arial'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(sym, x, y);
+  }
+  // trump label
+  const lx = x + LAYOUT.trumpDx/2, ly = y + CARD_H/2 + 16;
+  ctx.font = 'bold 11px Segoe UI, Arial'; ctx.textBaseline = 'middle';
+  const tw = ctx.measureText('TRUMP ').width;
+  ctx.font = 'bold 15px Arial';
+  const sw = ctx.measureText(sym).width;
+  ctx.textAlign = 'left';
+  ctx.font = 'bold 11px Segoe UI, Arial'; ctx.fillStyle = 'rgba(255,255,255,.8)';
+  ctx.fillText('TRUMP ', lx - (tw + sw)/2, ly);
+  ctx.font = 'bold 15px Arial'; ctx.fillStyle = RED_SUITS.has(suit) ? '#ff7b7b' : '#fff';
+  ctx.fillText(sym, lx - (tw + sw)/2 + tw, ly);
+}
+
+function drawDiscard() {
+  const { x, y } = LAYOUT.discard;
+  const n = view.discard;
+  ctx.fillStyle = 'rgba(255,255,255,.75)'; ctx.font = 'bold 11px Segoe UI, Arial';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('DISCARD', x, y - 52);
+  if (!n) {
+    const w = CARD_W*DISCARD_S, h = CARD_H*DISCARD_S;
+    rr(ctx, x - w/2, y - h/2, w, h, 6);
+    ctx.setLineDash([4, 3]); ctx.strokeStyle = 'rgba(255,255,255,.3)'; ctx.lineWidth = 1.5; ctx.stroke(); ctx.setLineDash([]);
+    return;
+  }
+  for (let i = Math.max(0, n - 14); i < n; i++) {
+    const p = discardPose(i);
+    drawCard(p.x, p.y, { faceUp: false, rot: p.rot, s: p.s });
+  }
+  ctx.fillStyle = 'rgba(255,255,255,.75)'; ctx.font = 'bold 11px Segoe UI, Arial';
+  ctx.fillText(String(n), x, y + 52);
+}
+
+function drawTable(now) {
+  const inter = interactive();
+  const defendable = inter
+    ? new Set(rlGame.legal.filter(a => a.t === AT.DEFEND).map(a => a.atkCard)) : new Set();
+  if (!view.table.some(e => e.atk || e.dfn)) {
+    ctx.fillStyle = 'rgba(255,255,255,.18)'; ctx.font = '14px Segoe UI, Arial';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('battle area', LAYOUT.tableCx, LAYOUT.tableY);
+  }
+  const pulse = 0.55 + 0.45 * Math.sin(now / 180);
+  view.table.forEach((e, i) => {
+    if (e.atk && !view.hidden.has(e.atk)) {
+      const pz = tablePose(i, 'atk');
+      const can = defendable.has(e.atk) && !e.dfn;
+      const sel = can && e.atk === selectedAtkCard;
+      const hov = can && hoverKey === e.atk;
+      placeCard(e.atk, pz.x, pz.y - (sel ? 10 : hov ? 5 : 0), pz.rot, 1,
+        { selected: sel, glow: can && !sel ? pulse : 0, hover: hov });
+      if (can) clickRegions.push({ x1: pz.x - CARD_W/2, y1: pz.y - CARD_H/2 - 10,
+        x2: pz.x + CARD_W/2, y2: pz.y + CARD_H/2, key: e.atk,
+        action: { t: '_selectAtk', card: e.atk } });
+    }
+    if (e.dfn && !view.hidden.has(e.dfn)) {
+      const pz = tablePose(i, 'dfn');
+      placeCard(e.dfn, pz.x, pz.y, pz.rot, 1, {});
+    }
+  });
+}
+
+function drawOpponent(p) {
+  const h = view.hands[p];
+  const passedAtk = view.active[p] && view.passed[p] && p !== view.defender;
+  ctx.save();
+  if (passedAtk) ctx.globalAlpha = 0.5;
+  h.forEach((c, i) => {
+    if (view.hidden.has(c)) return;
+    const sl = oppSlot(p, i, h.length);
+    placeCard(c, sl.x, sl.y, sl.rot, MINI_S, { faceUp: false });
+  });
+  ctx.restore();
+}
+
+function drawHuman(now) {
+  const hand = sortedHand(view.hands[HUMAN_SEAT]);
+  const inter = interactive();
+  hand.forEach((c, i) => {
+    if (view.hidden.has(c)) return;
+    const sl = humanSlot(i, hand.length);
+    const action = inter ? cardAction(c) : null;
+    const hov = !!action && hoverKey === c;
+    let glow = 0;
+    const ft = fresh.get(c);
+    if (ft !== undefined) { glow = Math.max(0, 1 - (now - ft) / 1200); if (!glow) fresh.delete(c); }
+    placeCard(c, sl.x, sl.y - (hov ? 16 : action ? 4 : 0), 0, 1,
+      { dim: inter && !action, hover: hov, glow });
+    if (action) clickRegions.push({ x1: sl.x - CARD_W/2, y1: sl.y - CARD_H/2 - 16,
+      x2: sl.x + CARD_W/2, y2: sl.y + CARD_H/2, key: c, action });
+  });
+}
+
+function pillWidth(text) { ctx.font = 'bold 10px Segoe UI, Arial'; return ctx.measureText(text).width + 14; }
+function pill(x0, y, text, bgc) {
+  const w = pillWidth(text), h = 17;
+  rr(ctx, x0, y - h/2, w, h, 8.5); ctx.fillStyle = bgc; ctx.fill();
+  ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(text, x0 + w/2, y + 0.5);
+  return w;
+}
+
+function drawPlate(p, now) {
+  const geo = seatGeom(p);
+  const { x, y } = geo.plate;
+  const active = view.active[p];
+  const isTurn = !view.gameOver && active && view.turn === p;
+  const isDef = active && p === view.defender;
+  const isAtk = active && p === view.attacker;
+  const cnt = view.hands[p].filter(c => !view.hidden.has(c)).length;
+  const label = `${p === HUMAN_SEAT ? 'You' : 'Player ' + p}  ·  ${cnt}`;
+  ctx.font = 'bold 13px Segoe UI, Arial';
+  const w = ctx.measureText(label).width + 30, h = 26;
+
+  ctx.save();
+  if (isTurn) { ctx.shadowColor = `rgba(255,215,64,${0.5 + 0.4*Math.sin(now/200)})`; ctx.shadowBlur = 20; }
+  rr(ctx, x - w/2, y - h/2, w, h, 13);
+  ctx.fillStyle = active ? 'rgba(8,28,16,.9)' : 'rgba(45,45,45,.85)'; ctx.fill();
+  ctx.restore();
+  rr(ctx, x - w/2, y - h/2, w, h, 13);
+  ctx.strokeStyle = isTurn ? '#ffd740' : isDef ? '#4aa3ff' : isAtk ? '#ff6b3d' : 'rgba(255,255,255,.25)';
+  ctx.lineWidth = isTurn ? 2.5 : 1.5; ctx.stroke();
+  ctx.fillStyle = active ? '#fff' : '#999'; ctx.font = 'bold 13px Segoe UI, Arial';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(label, x, y + 1);
+
+  // "thinking" dots for AI
+  if (isTurn && p !== HUMAN_SEAT && !busy) {
+    for (let i = 0; i < 3; i++) {
+      ctx.globalAlpha = 0.25 + 0.75 * Math.max(0, Math.sin(now/150 - i*0.8));
+      ctx.beginPath(); ctx.arc(x + w/2 + 10 + i*8, y, 2.8, 0, Math.PI*2);
+      ctx.fillStyle = '#ffd740'; ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // badges
+  const badges = [];
+  if (isTurn && p === HUMAN_SEAT) badges.push(['YOUR TURN', '#b8901a']);
+  if (isAtk) badges.push(['ATTACKER', '#d9482b']);
+  if (isDef) badges.push(['DEFENDER', '#2f7fd6']);
+  if (active && view.passed[p] && !view.gameOver)
+    badges.push(isDef ? ['TAKING', COLORS.take] : ['✓ PASSED', COLORS.pass]);
+  if (!active) {
+    const place = view.finished.indexOf(p);
+    if (place >= 0) badges.push([`OUT · #${place + 1}`, COLORS.gold]);
+  } else if (view.gameOver) badges.push(['LAST', '#8b2d2d']);
+
+  if (geo.badges === 'right') {
+    let bx = x + w/2 + 8;
+    for (const [t, c] of badges) bx += pill(bx, y, t, c) + 5;
+  } else {
+    const ws = badges.map(([t]) => pillWidth(t));
+    let bx = x - (ws.reduce((s, v) => s + v, 0) + 5*Math.max(0, ws.length - 1)) / 2;
+    badges.forEach(([t, c], i) => { pill(bx, y + h/2 + 13, t, c); bx += ws[i] + 5; });
+  }
+}
+
+function drawFlights(now) {
+  for (const f of flights) {
+    if (!f.started) continue;
+    const t = Math.min(1, (now - f.t0) / f.dur);
+    const e = easeInOutCubic(t);
+    const lift = Math.sin(Math.PI * t);
+    let faceUp = f.face1, sx = 1;
+    if (f.face0 !== f.face1) {
+      sx = Math.max(0.03, Math.abs(Math.cos(Math.PI * e)));
+      faceUp = e < 0.5 ? f.face0 : f.face1;
+    }
+    drawCard(lerp(f.p0.x, f.p1.x, e), lerp(f.p0.y, f.p1.y, e) - lift*24, {
+      card: f.card, faceUp, sx, hover: true,
+      s: lerp(f.p0.s, f.p1.s, e) * (1 + 0.1*lift),
+      rot: lerp(f.p0.rot, f.p1.rot, e),
+    });
+  }
+}
+
+function drawBubbles(now) {
+  bubbles = bubbles.filter(b => now - b.t0 < b.dur);
+  for (const b of bubbles) {
+    const t = (now - b.t0) / b.dur;
+    const sc = easeOutBack(Math.min(1, (now - b.t0) / 180));
+    const alpha = t > 0.75 ? (1 - t) / 0.25 : 1;
+    const { x, y } = seatGeom(b.seat).bubble;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.translate(x, y - 8*t); ctx.scale(sc, sc);
+    ctx.font = 'bold 14px Segoe UI, Arial';
+    const w = ctx.measureText(b.text).width + 22, h = 28;
+    ctx.shadowColor = 'rgba(0,0,0,.4)'; ctx.shadowBlur = 8; ctx.shadowOffsetY = 3;
+    rr(ctx, -w/2, -h/2, w, h, 14); ctx.fillStyle = b.color; ctx.fill();
+    ctx.beginPath(); ctx.moveTo(-6, h/2 - 1); ctx.lineTo(6, h/2 - 1); ctx.lineTo(0, h/2 + 8); ctx.closePath(); ctx.fill();
+    ctx.shadowColor = 'transparent';
+    ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(b.text, 0, 1);
+    ctx.restore();
+  }
+}
+
+function drawScene(now) {
+  ctx.drawImage(bg, 0, 0, CW, CH);
+  if (!view) return;
+  seen.clear();
+  drawArrows(now);
+  drawDeck();
+  drawDiscard();
+  drawTable(now);
+  for (let p = 0; p < NUM_PLAYERS; p++) if (p !== HUMAN_SEAT) drawOpponent(p);
+  drawHuman(now);
+  for (let p = 0; p < NUM_PLAYERS; p++) drawPlate(p, now);
+  drawFlights(now);
+  drawBubbles(now);
+  for (const k of disp.keys()) if (!seen.has(k)) disp.delete(k);
+}
+
+// ── Main loop ────────────────────────────────────────────────────────────
+let lastCursor = 'default';
+function frame(now) {
+  frameDt = Math.min(0.05, (now - lastT) / 1000); lastT = now;
+  updateFlights(now);
+  const reg = mouse && interactive() ? hitTest(mouse) : null;
+  hoverKey = reg ? reg.key : null;
+  const cur = reg ? 'pointer' : 'default';
+  if (cur !== lastCursor) { canvas.style.cursor = cur; lastCursor = cur; }
+  clickRegions = [];
+  drawScene(now);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ── UI (status line + buttons) ───────────────────────────────────────────
+function cardAction(card) {
+  const legal = rlGame.legal;
+  for (const a of legal)
+    if ((a.t === AT.ATTACK || a.t === AT.THROWIN) && a.card === card) return a;
+  const defs = legal.filter(a => a.t === AT.DEFEND && a.card === card);
+  if (selectedAtkCard) return defs.find(a => a.atkCard === selectedAtkCard) || null;
+  return defs.length === 1 ? defs[0] : null;
+}
+
+function humanPrompt() {
+  const g = rlGame.game, legal = rlGame.legal;
+  const has = t => legal.some(a => a.t === t);
+  if (has(AT.SWAP_TRUMP)) return ['You hold the 2 of trumps!', `Swap it for the ${cardStr(g.trump)}, or keep your hand.`];
+  if (has(AT.DEFEND))
+    return ['You are defending!', selectedAtkCard
+      ? `Pick a card to beat ${cardStr(selectedAtkCard)}, or take the cards.`
+      : 'Click a glowing attack card (or a card that beats it), or take the cards.'];
+  if (has(AT.DEFEND_PASS)) return ["You can't beat that", 'Take the cards.'];
+  if (has(AT.CONTINUE)) return ['Everything is beaten!', 'Throw in a card matching a rank on the table, or continue.'];
+  if (has(AT.ATTACK) && !g.attackPile.length) return ['Your attack', `Play any card against Player ${g.defender}.`];
+  return ['Pile on?', 'Add a card matching a rank on the table, or pass.'];
+}
+
+function updateUI() {
+  const g = rlGame.game;
+  const st = document.getElementById('status'), info = document.getElementById('info');
+  const actDiv = document.getElementById('actions');
+  actDiv.innerHTML = '';
+  if (g.gameOver) { st.textContent = 'Game over!'; info.textContent = ''; return; }
+  if (interactive()) {
+    const defendable = new Set(rlGame.legal.filter(a => a.t === AT.DEFEND).map(a => a.atkCard));
+    if (defendable.size === 1) selectedAtkCard = [...defendable][0];
+    else if (!defendable.has(selectedAtkCard)) selectedAtkCard = null;
+    const [s, i] = humanPrompt();
+    st.textContent = s; info.textContent = i;
+
+    const labels = { [AT.ATTACK_PASS]: ['Pass', 'pass'], [AT.DEFEND_PASS]: ['Take cards', 'take'],
+                     [AT.CONTINUE]: ['Continue', ''], [AT.DECLINE_SWAP]: ['Keep hand', 'pass'] };
+    for (const a of rlGame.legal) {
+      let label, cls = '';
+      if (a.t === AT.SWAP_TRUMP) label = `Swap trump (${cardStr(g.trump)})`;
+      else if (labels[a.t]) [label, cls] = labels[a.t];
+      else continue;
+      const btn = document.createElement('button');
+      btn.textContent = label; if (cls) btn.className = cls;
+      btn.onclick = () => playAction(a);
+      actDiv.appendChild(btn);
+    }
+  } else if (!busy) {
+    st.textContent = `Player ${rlGame.currentPlayer} is thinking…`;
+    info.textContent = '';
+  }
+}
+
+// ── Input ────────────────────────────────────────────────────────────────
+function canvasPoint(e) {
+  const r = canvas.getBoundingClientRect();
+  return { x: (e.clientX - r.left) * CW / r.width, y: (e.clientY - r.top) * CH / r.height };
+}
+function hitTest(pt) {
+  for (let i = clickRegions.length - 1; i >= 0; i--) {
+    const g = clickRegions[i];
+    if (pt.x >= g.x1 && pt.x <= g.x2 && pt.y >= g.y1 && pt.y <= g.y2) return g;
+  }
+  return null;
+}
+canvas.addEventListener('mousemove', e => { mouse = canvasPoint(e); });
+canvas.addEventListener('mouseleave', () => { mouse = null; });
+canvas.addEventListener('click', e => {
+  if (!interactive()) return;
+  const reg = hitTest(canvasPoint(e));
+  if (!reg) return;
+  if (reg.action.t === '_selectAtk') {
+    selectedAtkCard = selectedAtkCard === reg.action.card ? null : reg.action.card;
+    updateUI();
+  } else playAction(reg.action);
+});
+
+// ── Results dialog ───────────────────────────────────────────────────────
+function showResults() {
+  const g = rlGame.game;
+  const payoffs = rlGame.payoffs();
+  const order = [...g.finishedPlayers, ...[...Array(NUM_PLAYERS).keys()].filter(p => g.currentPlayers[p])];
+  const name = p => p === HUMAN_SEAT ? 'You' : `Player ${p}`;
+  document.getElementById('dlg-title').textContent =
+    order[0] === HUMAN_SEAT ? 'You won! 🎉' : order[order.length - 1] === HUMAN_SEAT ? 'You lost…' : 'Game over';
+  document.getElementById('dlg-body').textContent = order.map((p, r) =>
+    `#${r + 1}  ${name(p).padEnd(9)} ${payoffs[p] >= 0 ? '+' : ''}${payoffs[p].toFixed(2)}`).join('\n');
+  document.getElementById('overlay').classList.add('show');
+}
+document.getElementById('dlg-yes').onclick = () => {
+  document.getElementById('overlay').classList.remove('show');
+  newGame();
+};
+document.getElementById('dlg-no').onclick = () => {
+  document.getElementById('overlay').classList.remove('show');
+  document.getElementById('status').textContent = 'Thanks for playing!';
+};
+
+// ── Start ────────────────────────────────────────────────────────────────
+newGame();
+</script>
+</body>
+</html>
