@@ -67,7 +67,7 @@ import { TanRLGame, AT, NUM_ACTIONS, ALL_SUITS, RANK_VALUE, SUIT_SYMBOLS, CARD_I
 
 // ── ONNX Runtime ─────────────────────────────────────────────────────────
 const ort = await import('./ort/ort.min.mjs');
-ort.env.wasm.wasmPaths = './ort/';
+ort.env.wasm.wasmPaths = new URL('./ort/', document.baseURI).href;
 
 const NUM_PLAYERS = 3;
 const HUMAN_SEAT  = 0;
@@ -373,7 +373,7 @@ function flyTableToDiscard(card, idx, delay) {
   });
 }
 
-function flyDraw(card, q, delay, isTrumpCard) {
+function flyDraw(card, q, delay, isTrumpCard, markFresh = true) {
   return fly({
     card, delay, dur: 380, face0: isTrumpCard, face1: q === HUMAN_SEAT,
     from: () => isTrumpCard ? trumpPose() : deckTopPose(),
@@ -383,7 +383,10 @@ function flyDraw(card, q, delay, isTrumpCard) {
       view.hands[q].push(card); view.hidden.add(card);
     },
     to: () => handPose(q, card, true),
-    land: () => { view.hidden.delete(card); if (q === HUMAN_SEAT) fresh.set(card, performance.now()); },
+    land: () => {
+      view.hidden.delete(card);
+      if (markFresh && q === HUMAN_SEAT) fresh.set(card, performance.now());
+    },
   });
 }
 
@@ -482,7 +485,7 @@ async function newGame() {
   view.draw = [...view.draw, ...seq.map(o => o.c).reverse()];
   busy = true; updateUI();
   await sleep(300);
-  await Promise.all(seq.map(({ c, p }, k) => flyDraw(c, p, k * 55, false)));
+  await Promise.all(seq.map(({ c, p }, k) => flyDraw(c, p, k * 55, false, false)));
   if (myGen !== gen) return;
   syncView(); busy = false;
   advance(myGen);
