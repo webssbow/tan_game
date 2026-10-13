@@ -32,7 +32,7 @@ OUT_DIR = "docs/models"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 for seat in range(3):
-    pth = os.path.join(MODEL_DIR, f"{seat}_2081369600.pth") # change this later
+    pth = os.path.join(MODEL_DIR, f"{seat}_4340160000.pth") # change this later
     out = os.path.join(OUT_DIR, f"net_{seat}.onnx")
 
     agent = torch.load(pth, map_location="cpu", weights_only=False)
